@@ -37,7 +37,7 @@ typedef struct BadnessTree BadnessTree;
 
 /* One CST node or token (see `flags`), in a flat preorder table, root at
  * index 0. `kind` mirrors the enum below (which mirrors Rust's SyntaxKind in
- * src/syntax.rs -- keep both in the same order by hand). `start_utf16`/
+ * src/syntax.rs -- `build.rs` verifies their order). `start_utf16`/
  * `end_utf16` is a UTF-16 range, end exclusive. `parent`/`first_child`/
  * `next_sibling` are table indices or BADNESS_NONE; children form a
  * singly-linked list via first_child -> next_sibling in source order. */
@@ -61,7 +61,8 @@ typedef struct BadnessDiagnostic {
     uint32_t message_len;
 } BadnessDiagnostic;
 
-/* CST kind values mirror SyntaxKind's #[repr(u16)] discriminants. */
+/* CST kind values mirror SyntaxKind's #[repr(u16)] discriminants. `build.rs`
+ * checks this list and badness_cst_kind_name against src/syntax.rs. */
 enum {
     BADNESS_CONTROL_WORD,
     BADNESS_CONTROL_SYMBOL,

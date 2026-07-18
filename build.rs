@@ -449,12 +449,169 @@ fn generate_cli_markdown() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ensures the public C constants preserve `SyntaxKind`'s discriminants.
+///
+/// The C header is intentionally hand-written, but the FFI serializes raw
+/// `SyntaxKind as u16` values. A reordered or added Rust variant must therefore
+/// update the header in the same change.
+fn verify_ffi_syntax_kinds() {
+    fn enum_entries(source: &str, marker: &str, terminator: &str) -> Vec<String> {
+        let source = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("could not find {marker:?}"))
+            .1;
+        let body = source
+            .split_once('{')
+            .unwrap_or_else(|| panic!("could not find enum body after {marker:?}"))
+            .1
+            .split_once(terminator)
+            .unwrap_or_else(|| panic!("could not find enum terminator after {marker:?}"))
+            .0;
+
+        body.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("//") {
+                    return None;
+                }
+                let name = line.split_once(',')?.0.trim();
+                assert!(
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphabetic() || byte == b'_'),
+                    "FFI enums must use implicit, contiguous discriminants: {name}"
+                );
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    fn matched_syntax_kinds(source: &str, marker: &str) -> Vec<String> {
+        let source = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("could not find {marker:?}"))
+            .1;
+        let match_body = source
+            .split_once("matches!(")
+            .unwrap_or_else(|| panic!("could not find matches! after {marker:?}"))
+            .1;
+        let kinds: Vec<_> = match_body
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with(')'))
+            .filter_map(|line| {
+                let kind = line.trim().strip_prefix("SyntaxKind::")?;
+                let name = kind
+                    .split(|character: char| !character.is_ascii_uppercase() && character != '_')
+                    .next()
+                    .unwrap();
+                (!name.is_empty()).then(|| name.to_string())
+            })
+            .collect();
+        assert!(
+            !kinds.is_empty(),
+            "could not find SyntaxKind arms in matches! after {marker:?}"
+        );
+        kinds
+    }
+
+    fn screaming_snake_case(name: &str) -> String {
+        let mut result = String::new();
+        for (index, character) in name.char_indices() {
+            if character.is_ascii_uppercase() && index != 0 {
+                result.push('_');
+            }
+            result.push(character.to_ascii_uppercase());
+        }
+        result
+    }
+
+    let syntax = std::fs::read_to_string("src/syntax.rs")
+        .expect("src/syntax.rs must exist while building badness");
+    let ffi = std::fs::read_to_string("src/ffi.rs")
+        .expect("src/ffi.rs must exist while building badness");
+    let parser = std::fs::read_to_string("src/parser/grammar.rs")
+        .expect("src/parser/grammar.rs must exist while building badness");
+    let header = std::fs::read_to_string("include/badness_ffi.h")
+        .expect("include/badness_ffi.h must exist while building badness");
+
+    let rust_kinds = enum_entries(&syntax, "pub enum SyntaxKind", "\n}");
+    assert!(
+        rust_kinds.iter().all(|kind| kind
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'_')),
+        "SyntaxKind variants must use SCREAMING_SNAKE_CASE"
+    );
+    let expected: Vec<_> = rust_kinds
+        .iter()
+        .map(|kind| format!("BADNESS_{kind}"))
+        .collect();
+    let header_kinds = enum_entries(&header, "/* CST kind values", "\n};");
+
+    assert_eq!(
+        header_kinds, expected,
+        "include/badness_ffi.h kind constants must exactly match SyntaxKind's order"
+    );
+
+    let header_names: Vec<_> = header
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (name, rest) = line.strip_prefix("case ")?.split_once(':')?;
+            let display_name = rest.trim().strip_prefix("return \"")?.split_once('\"')?.0;
+            name.starts_with("BADNESS_")
+                .then(|| (name.to_string(), display_name.to_string()))
+        })
+        .collect();
+    let header_case_constants: Vec<_> = header_names
+        .iter()
+        .map(|(constant, _)| constant.clone())
+        .collect();
+    assert_eq!(
+        header_case_constants, expected,
+        "badness_cst_kind_name must cover every C CST kind constant"
+    );
+    let header_display_names: Vec<_> = header_names
+        .iter()
+        .map(|(_, display_name)| display_name.clone())
+        .collect();
+    assert_eq!(
+        header_display_names, rust_kinds,
+        "badness_cst_kind_name must return the matching SyntaxKind name"
+    );
+
+    let rust_statuses = enum_entries(&ffi, "pub enum BadnessStatus", "\n}");
+    let expected_statuses: Vec<_> = rust_statuses
+        .iter()
+        .map(|status| format!("BADNESS_{}", screaming_snake_case(status)))
+        .collect();
+    let header_statuses = enum_entries(&header, "typedef enum BadnessStatus", "\n} BadnessStatus;");
+    assert_eq!(
+        header_statuses, expected_statuses,
+        "include/badness_ffi.h status constants must exactly match BadnessStatus's order"
+    );
+
+    let mut parser_trivia = matched_syntax_kinds(&parser, "fn is_trivia(k: SyntaxKind)");
+    let mut ffi_trivia = matched_syntax_kinds(&ffi, "fn trivia_flag(kind: SyntaxKind)");
+    parser_trivia.sort();
+    ffi_trivia.sort();
+    assert_eq!(
+        ffi_trivia, parser_trivia,
+        "trivia_flag must cover exactly the parser's trivia kinds"
+    );
+}
+
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=data/cwl_signatures.json");
     println!("cargo:rerun-if-changed=data/package_metadata.json");
     println!("cargo:rerun-if-changed=src/cli.rs");
+    println!("cargo:rerun-if-changed=src/ffi.rs");
+    println!("cargo:rerun-if-changed=src/parser/grammar.rs");
+    println!("cargo:rerun-if-changed=src/syntax.rs");
+    println!("cargo:rerun-if-changed=include/badness_ffi.h");
     println!("cargo:rerun-if-changed=build.rs");
 
+    verify_ffi_syntax_kinds();
     generate_cwl_signatures();
     generate_package_metadata();
 
