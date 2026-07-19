@@ -3,6 +3,7 @@
 #endif
 
 #include <codecvt>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +30,7 @@ struct Arguments {
     InputSource input;
     bool lineMode = false;
     bool complete = false;
-    std::optional<size_t> offset;
+    std::optional<uint32_t> offset;
 };
 
 [[noreturn]] void fail(const char* message, int status) {
@@ -42,7 +43,7 @@ Arguments parse_args(int argc, char* argv[]) {
     std::string file;
     bool lineMode = false;
     bool complete = false;
-    size_t offset = 0;
+    uint32_t offset = 0;
 
     CLI::App app("Badness C++ FFI parser example", "badness_example");
     app.set_help_flag("-h,--help", "Show this help message and exit");
@@ -50,8 +51,8 @@ Arguments parse_args(int argc, char* argv[]) {
     auto* textOption = app.add_option("latex", text, "LaTeX code")->expected(0, 1);
     inputOption->excludes(textOption);
     app.add_flag("-l,--line", lineMode, "Parse each non-empty line separately");
-    app.add_flag("--complete", complete, "Unavailable until the completion C ABI is implemented");
-    auto* offsetOption = app.add_option("--offset", offset, "UTF-8 byte offset for --complete");
+    app.add_flag("--complete", complete, "Print completion candidates at --offset or end of input");
+    auto* offsetOption = app.add_option("--offset", offset, "UTF-16 code-unit offset for --complete");
 
     try {
         app.parse(argc, argv);
@@ -125,7 +126,50 @@ void print_tree(const badness::SyntaxTree& tree, badness::NodeId id, unsigned de
     }
 }
 
-bool parse_and_print(std::string_view utf8) {
+std::string debug_kind_name(uint16_t kind) {
+    const std::string_view name = badness_candidate_kind_name(kind);
+    std::string result;
+    bool capitalize = true;
+    for (char character : name) {
+        if (character == '_') {
+            capitalize = true;
+        } else {
+            result.push_back(capitalize ? character
+                                        : static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+            capitalize = false;
+        }
+    }
+    return result;
+}
+
+void print_debug_string(std::string_view text) {
+    std::putchar('"');
+    for (unsigned char character : text) {
+        switch (character) {
+        case '\\': std::fputs("\\\\", stdout); break;
+        case '"': std::fputs("\\\"", stdout); break;
+        case '\n': std::fputs("\\n", stdout); break;
+        case '\r': std::fputs("\\r", stdout); break;
+        case '\t': std::fputs("\\t", stdout); break;
+        default: std::putchar(character); break;
+        }
+    }
+    std::putchar('"');
+}
+
+void print_completion(const badness::CompletionResult& completion) {
+    for (const auto& candidate : completion.candidates) {
+        std::printf("%s %s", debug_kind_name(candidate.kind).c_str(), candidate.label.c_str());
+        if (candidate.insertText) {
+            std::fputs(candidate.snippet ? " [snippet] " : " [insert] ", stdout);
+            print_debug_string(*candidate.insertText);
+        }
+        std::putchar('\n');
+    }
+}
+
+bool parse_and_print(
+    std::string_view utf8, bool complete = false, std::optional<uint32_t> completionOffsetUtf16 = std::nullopt) {
     std::u16string source;
     try {
         source = to_utf16(utf8);
@@ -142,9 +186,28 @@ bool parse_and_print(std::string_view utf8) {
         return false;
     }
 
+    std::optional<badness::CompletionResult> completion;
+    if (complete) {
+        // badness_tree_complete clamps an out-of-range offset to the end of source.
+        const uint32_t offset = completionOffsetUtf16.value_or(static_cast<uint32_t>(source.size()));
+        BadnessCompletion* rawCompletion = nullptr;
+        const BadnessStatus completionStatus = badness_tree_complete(raw, offset, &rawCompletion);
+        if (completionStatus != BADNESS_OK) {
+            badness_tree_free(raw);
+            std::fprintf(stderr, "badness_tree_complete failed: %d\n", static_cast<int>(completionStatus));
+            return false;
+        }
+        completion = badness::BuildCompletionResult(rawCompletion);
+        badness_completion_free(rawCompletion);
+    }
+
     badness::SyntaxTree tree(raw, std::move(source));
     badness_tree_free(raw);
-    print_tree(tree, tree.root(), 0);
+    if (completion) {
+        print_completion(*completion);
+    } else {
+        print_tree(tree, tree.root(), 0);
+    }
     for (const auto& error : tree.errors()) {
         std::fprintf(stderr, "error @%u..%u: %s\n", error.start, error.end, error.message.c_str());
     }
@@ -190,12 +253,11 @@ int main(int argc, char* argv[]) {
         if (args.lineMode) {
             fail("Error: --complete cannot be combined with --line", 2);
         }
-        fail("Error: --complete is unavailable until the completion C ABI is implemented", 2);
     }
 
     if (args.lineMode) {
         parse_lines(input);
         return 0;
     }
-    return parse_and_print(input) ? 0 : 1;
+    return parse_and_print(input, args.complete, args.offset) ? 0 : 1;
 }

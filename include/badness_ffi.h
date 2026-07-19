@@ -12,6 +12,7 @@
 #define BADNESS_FFI_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -34,6 +35,8 @@ typedef enum BadnessStatus {
 
 /* Opaque; release with badness_tree_free. */
 typedef struct BadnessTree BadnessTree;
+/* Opaque; release with badness_completion_free. */
+typedef struct BadnessCompletion BadnessCompletion;
 
 /* One CST node or token (see `flags`), in a flat preorder table, root at
  * index 0. `kind` mirrors the enum below (which mirrors Rust's SyntaxKind in
@@ -60,6 +63,17 @@ typedef struct BadnessDiagnostic {
     const char *message;
     uint32_t message_len;
 } BadnessDiagnostic;
+
+/* A completion candidate. `label` and non-null `insert_text` are UTF-8,
+ * not null-terminated, and valid until badness_completion_free. */
+typedef struct BadnessCandidate {
+    const char *label;
+    uint32_t label_len;
+    uint16_t kind;
+    const char *insert_text;
+    uint32_t insert_text_len;
+    bool snippet;
+} BadnessCandidate;
 
 /* CST kind values mirror SyntaxKind's #[repr(u16)] discriminants. `build.rs`
  * checks this list and badness_cst_kind_name against src/syntax.rs. */
@@ -105,6 +119,19 @@ enum {
     BADNESS_TEXT,
     BADNESS_LINE_BREAK,
     BADNESS_ROOT,
+};
+
+/* Completion candidate kinds mirror completion::CandidateKind's #[repr(u16)]
+ * discriminants. */
+enum {
+    BADNESS_CANDIDATE_COMMAND,
+    BADNESS_CANDIDATE_ENVIRONMENT,
+    BADNESS_CANDIDATE_LABEL,
+    BADNESS_CANDIDATE_PACKAGE,
+    BADNESS_CANDIDATE_COLOR,
+    BADNESS_CANDIDATE_COLOR_MODEL,
+    BADNESS_CANDIDATE_TIKZ_LIBRARY,
+    BADNESS_CANDIDATE_ARGUMENT_ENUM,
 };
 
 /* Debug/display name for `kind`; "UNKNOWN" if out of range. */
@@ -155,6 +182,21 @@ static inline const char *badness_cst_kind_name(uint16_t kind) {
     }
 }
 
+/* Debug/display name for a completion candidate kind; "UNKNOWN" if invalid. */
+static inline const char *badness_candidate_kind_name(uint16_t kind) {
+    switch (kind) {
+    case BADNESS_CANDIDATE_COMMAND: return "COMMAND";
+    case BADNESS_CANDIDATE_ENVIRONMENT: return "ENVIRONMENT";
+    case BADNESS_CANDIDATE_LABEL: return "LABEL";
+    case BADNESS_CANDIDATE_PACKAGE: return "PACKAGE";
+    case BADNESS_CANDIDATE_COLOR: return "COLOR";
+    case BADNESS_CANDIDATE_COLOR_MODEL: return "COLOR_MODEL";
+    case BADNESS_CANDIDATE_TIKZ_LIBRARY: return "TIKZ_LIBRARY";
+    case BADNESS_CANDIDATE_ARGUMENT_ENUM: return "ARGUMENT_ENUM";
+    default: return "UNKNOWN";
+    }
+}
+
 /* Parses `source`/`source_len` (UTF-16 code units; caller retains ownership,
  * contents are copied). On success *out_tree is a new BadnessTree* (free
  * with badness_tree_free) and the return is BADNESS_OK; on failure *out_tree
@@ -168,6 +210,24 @@ BadnessStatus badness_parse_utf16(const uint16_t *source, size_t source_len, Bad
  * diagnostics, each `message`) are valid until badness_tree_free. */
 const BadnessCstNode *badness_tree_nodes(const BadnessTree *tree, uint32_t *out_count);
 const BadnessDiagnostic *badness_tree_diagnostics(const BadnessTree *tree, uint32_t *out_count);
+
+/* Computes candidates for `offset_utf16` in `tree`. Offsets past the source
+ * clamp to its end. On success *out_completion is a new result, freed with
+ * badness_completion_free. */
+BadnessStatus badness_tree_complete(
+    const BadnessTree *tree,
+    uint32_t offset_utf16,
+    BadnessCompletion **out_completion
+);
+
+/* Read-only bulk view of a completion's candidates. A null completion yields
+ * null + *out_count = 0. Candidate string views are valid until that
+ * completion is freed. */
+const BadnessCandidate *badness_completion_candidates(
+    const BadnessCompletion *completion,
+    uint32_t *out_count
+);
+void badness_completion_free(BadnessCompletion *completion);
 
 /* Frees a tree from badness_parse_utf16; null is a no-op. */
 void badness_tree_free(BadnessTree *tree);

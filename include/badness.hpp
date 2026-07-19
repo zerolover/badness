@@ -6,8 +6,8 @@
 // target to build or link.
 //
 // This header is deliberately independent of any particular UI framework.
-// Strings are std::u16string throughout, so a caller-side adapter converts
-// them only at the integration boundary.
+// Source/CST text uses std::u16string; diagnostics and completion strings stay
+// UTF-8 until the caller's integration boundary.
 //
 #include <cassert>
 #include <cstdint>
@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "badness_ffi.h"
@@ -50,6 +51,39 @@ struct SyntaxError {
     uint32_t end = 0;   // UTF-16 offset, exclusive
     std::string message; // UTF-8
 };
+
+// A copied completion candidate.
+struct CompletionCandidate {
+    std::string label;
+    uint16_t kind = 0;
+    std::optional<std::string> insertText;
+    bool snippet = false;
+};
+
+// A copied completion result.
+struct CompletionResult {
+    std::vector<CompletionCandidate> candidates;
+};
+
+// Copies an FFI completion result. The caller may free raw immediately after.
+inline CompletionResult BuildCompletionResult(const BadnessCompletion* raw) {
+    uint32_t count = 0;
+    const BadnessCandidate* rawCandidates = badness_completion_candidates(raw, &count);
+    CompletionResult result;
+    result.candidates.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const BadnessCandidate& candidate = rawCandidates[i];
+        CompletionCandidate copy;
+        copy.label = std::string(candidate.label, candidate.label_len);
+        copy.kind = candidate.kind;
+        if (candidate.insert_text != nullptr) {
+            copy.insertText = std::string(candidate.insert_text, candidate.insert_text_len);
+        }
+        copy.snippet = candidate.snippet;
+        result.candidates.push_back(std::move(copy));
+    }
+    return result;
+}
 
 // An immutable CST snapshot from badness_parse_utf16. The constructor copies
 // the FFI node and diagnostic views into local CSR storage. The caller retains

@@ -113,6 +113,7 @@ impl FileArgKind {
 /// The kind of a name candidate, mapped to an LSP `CompletionItemKind` by the
 /// server layer (kept LSP-type-free here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum CandidateKind {
     Command,
     Environment,

@@ -515,6 +515,22 @@ fn verify_ffi_syntax_kinds() {
         kinds
     }
 
+    fn kind_name_cases(source: &str, marker: &str) -> Vec<(String, String)> {
+        source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("could not find {marker:?}"))
+            .1
+            .lines()
+            .take_while(|line| line.trim() != "}")
+            .filter_map(|line| {
+                let line = line.trim();
+                let (name, rest) = line.strip_prefix("case ")?.split_once(':')?;
+                let display_name = rest.trim().strip_prefix("return \"")?.split_once('\"')?.0;
+                Some((name.to_string(), display_name.to_string()))
+            })
+            .collect()
+    }
+
     fn screaming_snake_case(name: &str) -> String {
         let mut result = String::new();
         for (index, character) in name.char_indices() {
@@ -530,6 +546,8 @@ fn verify_ffi_syntax_kinds() {
         .expect("src/syntax.rs must exist while building badness");
     let ffi = std::fs::read_to_string("src/ffi.rs")
         .expect("src/ffi.rs must exist while building badness");
+    let completion = std::fs::read_to_string("src/completion.rs")
+        .expect("src/completion.rs must exist while building badness");
     let parser = std::fs::read_to_string("src/parser/grammar.rs")
         .expect("src/parser/grammar.rs must exist while building badness");
     let header = std::fs::read_to_string("include/badness_ffi.h")
@@ -553,16 +571,7 @@ fn verify_ffi_syntax_kinds() {
         "include/badness_ffi.h kind constants must exactly match SyntaxKind's order"
     );
 
-    let header_names: Vec<_> = header
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let (name, rest) = line.strip_prefix("case ")?.split_once(':')?;
-            let display_name = rest.trim().strip_prefix("return \"")?.split_once('\"')?.0;
-            name.starts_with("BADNESS_")
-                .then(|| (name.to_string(), display_name.to_string()))
-        })
-        .collect();
+    let header_names = kind_name_cases(&header, "static inline const char *badness_cst_kind_name");
     let header_case_constants: Vec<_> = header_names
         .iter()
         .map(|(constant, _)| constant.clone())
@@ -591,6 +600,41 @@ fn verify_ffi_syntax_kinds() {
         "include/badness_ffi.h status constants must exactly match BadnessStatus's order"
     );
 
+    let candidate_kinds = enum_entries(&completion, "pub enum CandidateKind", "\n}");
+    let expected_candidate_kinds: Vec<_> = candidate_kinds
+        .iter()
+        .map(|kind| format!("BADNESS_CANDIDATE_{}", screaming_snake_case(kind)))
+        .collect();
+    let header_candidate_kinds = enum_entries(&header, "/* Completion candidate kinds", "\n};");
+    assert_eq!(
+        header_candidate_kinds, expected_candidate_kinds,
+        "completion candidate constants must exactly match CandidateKind's order"
+    );
+    let header_candidate_names = kind_name_cases(
+        &header,
+        "static inline const char *badness_candidate_kind_name",
+    );
+    let header_candidate_constants: Vec<_> = header_candidate_names
+        .iter()
+        .map(|(constant, _)| constant.clone())
+        .collect();
+    assert_eq!(
+        header_candidate_constants, expected_candidate_kinds,
+        "badness_candidate_kind_name must cover every completion candidate kind"
+    );
+    let expected_candidate_names: Vec<_> = candidate_kinds
+        .iter()
+        .map(|kind| screaming_snake_case(kind))
+        .collect();
+    let header_candidate_display_names: Vec<_> = header_candidate_names
+        .iter()
+        .map(|(_, display_name)| display_name.clone())
+        .collect();
+    assert_eq!(
+        header_candidate_display_names, expected_candidate_names,
+        "badness_candidate_kind_name must return the matching CandidateKind name"
+    );
+
     let mut parser_trivia = matched_syntax_kinds(&parser, "fn is_trivia(k: SyntaxKind)");
     let mut ffi_trivia = matched_syntax_kinds(&ffi, "fn trivia_flag(kind: SyntaxKind)");
     parser_trivia.sort();
@@ -606,6 +650,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=data/package_metadata.json");
     println!("cargo:rerun-if-changed=src/cli.rs");
     println!("cargo:rerun-if-changed=src/ffi.rs");
+    println!("cargo:rerun-if-changed=src/completion.rs");
     println!("cargo:rerun-if-changed=src/parser/grammar.rs");
     println!("cargo:rerun-if-changed=src/syntax.rs");
     println!("cargo:rerun-if-changed=include/badness_ffi.h");

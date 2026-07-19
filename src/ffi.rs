@@ -1,15 +1,17 @@
 //! C ABI over a lossless, UTF-16-ranged CST snapshot. Mirrored by hand in
-//! `include/badness_ffi.h` (no cbindgen) — keep both in sync. Rowan stays
-//! internal; callers get a flat node table navigated via `parent`/
-//! `first_child`/`next_sibling` indices.
+//! `include/badness_ffi.h` (no cbindgen) — keep both in sync. Rowan types
+//! never cross the C boundary; callers get a flat node table navigated via
+//! `parent`/`first_child`/`next_sibling` indices.
 
 use std::ffi::c_char;
 use std::ptr;
 
-use rowan::NodeOrToken;
+use rowan::{GreenNode, NodeOrToken};
 
+use crate::completion::{CandidateKind, candidates, classify_context};
 use crate::parser::parse;
-use crate::syntax::{SyntaxElement, SyntaxKind};
+use crate::semantic::{SemanticModel, scan_definitions};
+use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 
 /// Sentinel used when an FFI node has no parent, child, or sibling.
 pub const BADNESS_NONE: u32 = u32::MAX;
@@ -33,12 +35,28 @@ pub enum BadnessStatus {
 /// never a C/C++ allocator.
 pub struct BadnessTree {
     nodes: Vec<BadnessCstNode>,
+    /// The green tree, not rowan's red `SyntaxNode`: red nodes use non-atomic
+    /// `Cell`s, so sharing one across threads via this FFI's raw pointer would
+    /// race. `GreenNode` is `Send + Sync`; [`badness_tree_complete`] rebuilds
+    /// a red root per call via `SyntaxNode::new_root`.
+    green: GreenNode,
+    /// Original UTF-8 source, retained to convert completion offsets from UTF-16.
+    text: String,
     /// Kept alive, never mutated after construction, purely so `diagnostics_ffi`'s
     /// pointers into its `message` strings stay valid.
     #[allow(dead_code)]
     diagnostics: Vec<Diagnostic>,
     /// Precomputed bulk view over `diagnostics`, for [`badness_tree_diagnostics`].
     diagnostics_ffi: Vec<BadnessDiagnostic>,
+}
+
+/// An opaque completion result. Release with [`badness_completion_free`].
+pub struct BadnessCompletion {
+    /// Kept alive, never mutated after construction, so `candidates_ffi` string
+    /// pointers remain valid.
+    #[allow(dead_code)]
+    candidates: Vec<CompletionCandidate>,
+    candidates_ffi: Vec<BadnessCandidate>,
 }
 
 /// A single CST element (node or token). `kind` mirrors a [`SyntaxKind`]
@@ -74,6 +92,27 @@ struct Diagnostic {
     start_utf16: u32,
     end_utf16: u32,
     message: String,
+}
+
+/// A completion candidate. UTF-8 strings remain valid until the owning
+/// [`BadnessCompletion`] is freed; `insert_text` is null when absent.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BadnessCandidate {
+    pub label: *const c_char,
+    pub label_len: u32,
+    pub kind: u16,
+    pub insert_text: *const c_char,
+    pub insert_text_len: u32,
+    pub snippet: bool,
+}
+
+/// Owns UTF-8 candidate strings for a [`BadnessCompletion`].
+struct CompletionCandidate {
+    label: String,
+    kind: CandidateKind,
+    insert_text: Option<String>,
+    snippet: bool,
 }
 
 /// Parses `source` (UTF-16) into a CST; `source`'s contents are copied, so
@@ -149,6 +188,77 @@ pub unsafe extern "C" fn badness_tree_diagnostics(
     tree.diagnostics_ffi.as_ptr()
 }
 
+/// Completes at `offset_utf16`, clamped to the end of the source when needed.
+/// On success, writes a new [`BadnessCompletion`] to `out_completion`.
+///
+/// # Safety
+///
+/// `tree` must be a live [`BadnessTree`] and `out_completion` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn badness_tree_complete(
+    tree: *const BadnessTree,
+    offset_utf16: u32,
+    out_completion: *mut *mut BadnessCompletion,
+) -> BadnessStatus {
+    if out_completion.is_null() {
+        return BadnessStatus::NullPointer;
+    }
+    // SAFETY: checked non-null above; `out_completion` is writable per this fn's contract.
+    unsafe { *out_completion = ptr::null_mut() };
+    if tree.is_null() {
+        return BadnessStatus::NullPointer;
+    }
+
+    // SAFETY: checked non-null above; the caller upholds the lifetime contract.
+    let tree = unsafe { &*tree };
+    let offset = utf16_to_byte_offset(&tree.text, offset_utf16);
+    let root = SyntaxNode::new_root(tree.green.clone());
+    let context = classify_context(&root, offset);
+    let user_sigs = scan_definitions(&root);
+    let model = SemanticModel::build(&root);
+    let candidates = candidates(&context, &user_sigs, &model);
+    let completion = completion_snapshot(candidates);
+
+    // SAFETY: `out_completion` is writable for this call per the function contract.
+    unsafe { *out_completion = Box::into_raw(Box::new(completion)) };
+    BadnessStatus::Ok
+}
+
+/// Read-only view of completion candidates; null completion yields null + zero.
+///
+/// # Safety
+///
+/// `completion` must be null or a live [`BadnessCompletion`]; `out_count` must
+/// be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn badness_completion_candidates(
+    completion: *const BadnessCompletion,
+    out_count: *mut u32,
+) -> *const BadnessCandidate {
+    let Some(completion) = (unsafe { completion.as_ref() }) else {
+        // SAFETY: required by this function's contract.
+        unsafe { *out_count = 0 };
+        return ptr::null();
+    };
+    // SAFETY: required by this function's contract.
+    unsafe { *out_count = completion.candidates_ffi.len() as u32 };
+    completion.candidates_ffi.as_ptr()
+}
+
+/// Releases a completion from [`badness_tree_complete`]; null is a no-op.
+///
+/// # Safety
+///
+/// `completion` must be null or an unfreed pointer from
+/// [`badness_tree_complete`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn badness_completion_free(completion: *mut BadnessCompletion) {
+    if !completion.is_null() {
+        // SAFETY: upheld by this function's safety contract.
+        unsafe { drop(Box::from_raw(completion)) };
+    }
+}
+
 /// Releases a tree from [`badness_parse_utf16`]; null is a no-op.
 ///
 /// # Safety
@@ -174,6 +284,7 @@ fn parse_utf16_snapshot(units: &[u16]) -> Result<BadnessTree, BadnessStatus> {
 
     let parsed = parse(&text);
     let root = parsed.syntax();
+    let green = root.green().into_owned();
     let utf16_offsets = byte_to_utf16_offsets(&text)?;
     let mut nodes = Vec::new();
     let root_id = lower_element(
@@ -206,9 +317,73 @@ fn parse_utf16_snapshot(units: &[u16]) -> Result<BadnessTree, BadnessStatus> {
 
     Ok(BadnessTree {
         nodes,
+        green,
+        text,
         diagnostics,
         diagnostics_ffi,
     })
+}
+
+fn completion_snapshot(
+    candidates: Vec<crate::completion::CompletionCandidate>,
+) -> BadnessCompletion {
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .map(|candidate| CompletionCandidate {
+            label: candidate.label,
+            kind: candidate.kind,
+            insert_text: candidate.insert_text,
+            snippet: candidate.snippet,
+        })
+        .collect();
+    let candidates_ffi = candidates
+        .iter()
+        .map(|candidate| {
+            let (insert_text, insert_text_len) = candidate
+                .insert_text
+                .as_ref()
+                .map_or((ptr::null(), 0), |text| {
+                    (text.as_ptr().cast(), text.len() as u32)
+                });
+            BadnessCandidate {
+                label: candidate.label.as_ptr().cast(),
+                label_len: candidate.label.len() as u32,
+                kind: candidate.kind as u16,
+                insert_text,
+                insert_text_len,
+                snippet: candidate.snippet,
+            }
+        })
+        .collect();
+
+    BadnessCompletion {
+        candidates,
+        candidates_ffi,
+    }
+}
+
+/// Converts an absolute UTF-16 offset into a valid UTF-8 byte boundary.
+/// Values past the source clamp to the end; offsets in a surrogate pair clamp
+/// to that scalar's start.
+fn utf16_to_byte_offset(text: &str, offset_utf16: u32) -> usize {
+    let target = offset_utf16 as usize;
+    let mut utf16_offset = 0usize;
+
+    for (byte_offset, ch) in text.char_indices() {
+        if target <= utf16_offset {
+            return byte_offset;
+        }
+        let next = utf16_offset + ch.len_utf16();
+        if target < next {
+            return byte_offset;
+        }
+        if target == next {
+            return byte_offset + ch.len_utf8();
+        }
+        utf16_offset = next;
+    }
+
+    text.len()
 }
 
 /// Map each UTF-8 character boundary in `text` to its UTF-16 code-unit offset.
@@ -414,5 +589,58 @@ mod tests {
     #[test]
     fn badness_tree_free_of_null_is_a_no_op() {
         unsafe { badness_tree_free(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn completion_returns_utf8_candidates_from_the_tree_snapshot() {
+        let source = "\\sec";
+        let source_utf16: Vec<u16> = source.encode_utf16().collect();
+        let tree = parse_utf16_snapshot(&source_utf16).unwrap();
+        let mut completion: *mut BadnessCompletion = ptr::null_mut();
+
+        let status =
+            unsafe { badness_tree_complete(&tree, source_utf16.len() as u32, &mut completion) };
+        assert_eq!(status, BadnessStatus::Ok);
+        assert!(!completion.is_null());
+
+        let mut count = 0;
+        let candidates = unsafe { badness_completion_candidates(completion, &mut count) };
+        assert!(count > 0);
+        let section = unsafe { std::slice::from_raw_parts(candidates, count as usize) }
+            .iter()
+            .find(|candidate| {
+                candidate.kind == CandidateKind::Command as u16
+                    && std::str::from_utf8(unsafe {
+                        std::slice::from_raw_parts(
+                            candidate.label.cast::<u8>(),
+                            candidate.label_len as usize,
+                        )
+                    })
+                    .is_ok_and(|label| label == "section")
+            });
+        assert!(section.is_some());
+
+        unsafe { badness_completion_free(completion) };
+    }
+
+    #[test]
+    fn utf16_offsets_clamp_to_valid_utf8_boundaries() {
+        let text = "a😀z";
+        assert_eq!(utf16_to_byte_offset(text, 0), 0);
+        assert_eq!(utf16_to_byte_offset(text, 1), 1);
+        assert_eq!(utf16_to_byte_offset(text, 2), 1);
+        assert_eq!(utf16_to_byte_offset(text, 3), 5);
+        assert_eq!(utf16_to_byte_offset(text, 99), text.len());
+    }
+
+    #[test]
+    fn completion_rejects_null_inputs() {
+        let status = unsafe { badness_tree_complete(ptr::null(), 0, ptr::null_mut()) };
+        assert_eq!(status, BadnessStatus::NullPointer);
+
+        let mut completion = ptr::dangling_mut::<BadnessCompletion>();
+        let status = unsafe { badness_tree_complete(ptr::null(), 0, &mut completion) };
+        assert_eq!(status, BadnessStatus::NullPointer);
+        assert!(completion.is_null());
     }
 }

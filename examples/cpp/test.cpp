@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -6,17 +7,37 @@
 
 namespace {
 
-badness::SyntaxTree parse(std::u16string source) {
+BadnessTree* parse_raw(const std::u16string& source) {
     BadnessTree* raw = nullptr;
     const BadnessStatus status = badness_parse_utf16(
         reinterpret_cast<const uint16_t*>(source.data()), source.size(), &raw);
     if (status != BADNESS_OK) {
         throw std::runtime_error("badness_parse_utf16 failed");
     }
+    return raw;
+}
 
+badness::SyntaxTree parse(std::u16string source) {
+    BadnessTree* raw = parse_raw(source);
     badness::SyntaxTree tree(raw, std::move(source));
     badness_tree_free(raw);
     return tree;
+}
+
+badness::CompletionResult complete(const std::u16string& source, uint32_t offset) {
+    BadnessTree* raw = parse_raw(source);
+
+    BadnessCompletion* rawCompletion = nullptr;
+    const BadnessStatus completionStatus = badness_tree_complete(raw, offset, &rawCompletion);
+    if (completionStatus != BADNESS_OK) {
+        badness_tree_free(raw);
+        throw std::runtime_error("badness_tree_complete failed");
+    }
+
+    badness::CompletionResult result = badness::BuildCompletionResult(rawCompletion);
+    badness_completion_free(rawCompletion);
+    badness_tree_free(raw);
+    return result;
 }
 
 } // namespace
@@ -217,6 +238,33 @@ UTEST(SyntaxTree, TokenAtOffset) {
     const auto empty = parse(u"").tokenAt(0);
     ASSERT_FALSE(empty.left);
     ASSERT_FALSE(empty.right);
+}
+
+UTEST(Completion, CopiesCandidatesBeforeReleasingRustHandles) {
+    const std::u16string source = u"\\sec";
+    const auto result = complete(source, static_cast<uint32_t>(source.size()));
+    const auto section = std::find_if(result.candidates.begin(), result.candidates.end(), [](const auto& candidate) {
+        return candidate.label == "section";
+    });
+
+    ASSERT_TRUE(section != result.candidates.end());
+    ASSERT_EQ(static_cast<uint16_t>(BADNESS_CANDIDATE_COMMAND), section->kind);
+    ASSERT_FALSE(section->insertText);
+    ASSERT_FALSE(section->snippet);
+}
+
+UTEST(Completion, CopiesUtf8Snippets) {
+    const std::u16string source = u"\\begin{ite";
+    const auto result = complete(source, static_cast<uint32_t>(source.size()));
+    const auto itemize = std::find_if(result.candidates.begin(), result.candidates.end(), [](const auto& candidate) {
+        return candidate.label == "itemize";
+    });
+
+    ASSERT_TRUE(itemize != result.candidates.end());
+    ASSERT_EQ(static_cast<uint16_t>(BADNESS_CANDIDATE_ENVIRONMENT), itemize->kind);
+    ASSERT_TRUE(itemize->insertText);
+    ASSERT_TRUE(*itemize->insertText == "itemize}\n\t$0\n\\end{itemize}");
+    ASSERT_TRUE(itemize->snippet);
 }
 
 UTEST_MAIN()
