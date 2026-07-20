@@ -1,0 +1,79 @@
+name: Build FFI Bundles
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Pull Docker image
+        run: docker pull ghcr.io/zerolover/mydocker/lo:almalinux
+
+      - name: Build Linux FFI bundle
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            ghcr.io/zerolover/mydocker/lo:almalinux \
+            /bin/bash /workspace/scripts/build-ffi.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: badness-linux-x86_64-ffi
+          path: dist/badness-ffi
+          if-no-files-found: error
+
+  build-native:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            runner: macos-15
+            artifact_name: badness-macos-arm64-ffi
+          - label: macOS x86_64
+            runner: macos-15-intel
+            artifact_name: badness-macos-x86_64-ffi
+          - label: Windows x86_64
+            runner: windows-latest
+            artifact_name: badness-windows-x86_64-ffi
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build FFI bundle (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/build-ffi.sh
+
+      - name: Build FFI bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\build-ffi.bat
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/badness-ffi
+          if-no-files-found: error
