@@ -18,7 +18,7 @@ if errorlevel 1 (
 if not exist "%INCLUDE_DIR%" mkdir "%INCLUDE_DIR%"
 if not exist "%LIB_DIR%" mkdir "%LIB_DIR%"
 
-cargo build --manifest-path "%REPO_ROOT%\Cargo.toml" --release --lib
+cargo build --manifest-path "%REPO_ROOT%\Cargo.toml" --release --lib --features compact-data
 
 copy /Y "%REPO_ROOT%\include\badness_ffi.h" "%INCLUDE_DIR%\badness_ffi.h" >nul
 copy /Y "%REPO_ROOT%\include\badness.hpp" "%INCLUDE_DIR%\badness.hpp" >nul

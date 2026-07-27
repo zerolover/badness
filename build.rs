@@ -13,6 +13,11 @@
 //! `src/semantic/signature.rs`; the `reflow`/`block` *derivations* are NOT
 //! duplicated here — they live in the `environment` const fn, applied at the
 //! generated call site, so the JSON path and this codegen path can never differ.
+//!
+//! **`compact-data` feature**: skips the phf bake in favor of a deflated JSON
+//! blob, decompressed+parsed lazily at runtime — see
+//! `src/semantic/signature.rs` for the rationale and
+//! `generate_cwl_signatures_compact` below for the codegen.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -201,10 +206,18 @@ struct RawDb {
 }
 
 /// Bake the bulk CWL signature tier into `$OUT_DIR/cwl_signatures.rs` as a `phf`
-/// map (see the module docs).
+/// map (see the module docs), or dispatch to [`generate_cwl_signatures_compact`]
+/// under the `compact-data` feature. `CARGO_FEATURE_COMPACT_DATA` is the
+/// Cargo-supplied env var mirroring the package's own `compact-data` feature.
 fn generate_cwl_signatures() {
     let json = std::fs::read_to_string("data/cwl_signatures.json")
         .expect("data/cwl_signatures.json must exist (run `task cwl:sync`)");
+
+    if env::var_os("CARGO_FEATURE_COMPACT_DATA").is_some() {
+        generate_cwl_signatures_compact(&json);
+        return;
+    }
+
     let db: RawDb = serde_json::from_str(&json).expect("data/cwl_signatures.json must be valid");
 
     let mut commands = phf_codegen::Map::new();
@@ -238,6 +251,17 @@ fn generate_cwl_signatures() {
     let path = Path::new(&env::var("OUT_DIR").unwrap()).join("cwl_signatures.rs");
     let mut file = BufWriter::new(File::create(&path).unwrap());
     file.write_all(out.as_bytes()).unwrap();
+}
+
+/// `compact-data`: deflate-compress the raw `data/cwl_signatures.json` bytes
+/// (~400 KB) into `$OUT_DIR/cwl_signatures.deflate` (~56 KB). No schema
+/// validation happens here — the default (non-`compact-data`) build already
+/// validates the same file via `RawDb`, and the runtime `parse()` call in
+/// `src/semantic/signature.rs` fails loudly if it's ever malformed.
+fn generate_cwl_signatures_compact(json: &str) {
+    let compressed = miniz_oxide::deflate::compress_to_vec(json.as_bytes(), 10);
+    let path = Path::new(&env::var("OUT_DIR").unwrap()).join("cwl_signatures.deflate");
+    std::fs::write(&path, &compressed).unwrap();
 }
 
 /// The on-disk shape of `data/package_metadata.json`: a `note` header (ignored) plus

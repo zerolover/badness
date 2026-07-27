@@ -15,9 +15,7 @@ fi
 
 mkdir -p "$INCLUDE_DIR" "$LIB_DIR"
 
-# badness is a single package (crate-type = ["rlib", "cdylib"]); --lib skips
-# building the `badness` CLI binary, which the FFI bundle doesn't need.
-cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release --lib
+cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release --lib --features compact-data
 
 cp "$REPO_ROOT/include/badness_ffi.h" "$INCLUDE_DIR/badness_ffi.h"
 cp "$REPO_ROOT/include/badness.hpp" "$INCLUDE_DIR/badness.hpp"
